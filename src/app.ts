@@ -50,16 +50,7 @@ if (process.env.REPLIT_DOMAINS) {
 
 app.use(cors({
   credentials: true,
-  origin: (origin, callback) => {
-    // Allow if no origin (like mobile apps or curl) or if it's in the allowed list
-    if (!origin || allowedOrigins.some(o => origin.startsWith(o))) {
-      callback(null, true);
-    } else if (isDev) {
-      callback(null, true);
-    } else {
-      callback(new Error(`CORS: Origin ${origin} not allowed`));
-    }
-  },
+  origin: true,
 }));
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
