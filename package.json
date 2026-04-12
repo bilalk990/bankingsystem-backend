@@ -5,11 +5,11 @@
   "type": "module",
   "scripts": {
     "dev": "cross-env NODE_OPTIONS=\"--expose-gc --max-old-space-size=3072\" NODE_ENV=development tsx ./src/index.ts",
-    "build": "tsx ./build.ts",
+    "build": "npx tsx ./build.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "db:push": "drizzle-kit push --config ./drizzle.config.ts",
     "db:push-force": "drizzle-kit push --force --config ./drizzle.config.ts",
-    "seed": "tsx ./src/scripts/seed.ts",
+    "seed": "npx tsx ./src/scripts/seed.ts",
     "start": "node dist/index.cjs"
   },
   "dependencies": {
