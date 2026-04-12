@@ -30,6 +30,7 @@ const allowlist = [
   "uuid",
   "ws",
   "exceljs",
+  "dotenv",
 ];
 
 async function buildAll() {
