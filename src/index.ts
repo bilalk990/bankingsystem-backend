@@ -39,7 +39,7 @@ if (Number.isNaN(port) || port <= 0) {
 }
 
 Promise.all([seedRolePermissions(), seedDefaultFunders(), resetAdminPassword(), oneTimeDataWipe()]).then(() => {
-  const server = app.listen(port, () => {
+  const server = app.listen(port, '0.0.0.0', () => {
     console.log(`Server listening on port ${port}`);
   });
   server.timeout = 30 * 60 * 1000;
@@ -49,7 +49,7 @@ Promise.all([seedRolePermissions(), seedDefaultFunders(), resetAdminPassword(), 
   console.log("[Resume-Scrub] Auto-resume disabled — use 'Start Scrubbing' button to resume incomplete leads");
 }).catch((err) => {
   console.error("Failed to seed:", err);
-  const server = app.listen(port, () => {
+  const server = app.listen(port, '0.0.0.0', () => {
     console.log(`Server listening on port ${port}`);
   });
   server.timeout = 30 * 60 * 1000;
