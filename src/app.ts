@@ -14,24 +14,24 @@ app.set("case sensitive routing", false);
 
 const isProduction = process.env.NODE_ENV === "production";
 
-app.use(helmet({
-  contentSecurityPolicy: {
-    directives: {
-      defaultSrc: ["'self'"],
-      scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'"],
-      styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
-      fontSrc: ["'self'", "https://fonts.gstatic.com"],
-      imgSrc: ["'self'", "data:", "blob:", "https:"],
-      connectSrc: ["'self'", "https:", "wss:"],
-      frameSrc: ["'self'"],
-      objectSrc: ["'none'"],
-      baseUri: ["'self'"],
-      formAction: ["'self'"],
-    },
-  },
-  crossOriginEmbedderPolicy: false,
-  crossOriginResourcePolicy: { policy: "cross-origin" },
-}));
+// app.use(helmet({
+//   contentSecurityPolicy: {
+//     directives: {
+//       defaultSrc: ["'self'"],
+//       scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'"],
+//       styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+//       fontSrc: ["'self'", "https://fonts.gstatic.com"],
+//       imgSrc: ["'self'", "data:", "blob:", "https:"],
+//       connectSrc: ["'self'", "https:", "wss:"],
+//       frameSrc: ["'self'"],
+//       objectSrc: ["'none'"],
+//       baseUri: ["'self'"],
+//       formAction: ["'self'"],
+//     },
+//   },
+//   crossOriginEmbedderPolicy: false,
+//   crossOriginResourcePolicy: { policy: "cross-origin" },
+// }));
 
 const isDev = process.env.NODE_ENV !== "production";
 const envOrigin = process.env.CORS_ORIGIN;
