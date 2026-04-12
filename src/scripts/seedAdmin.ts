@@ -23,7 +23,7 @@ export async function resetAdminPassword() {
       console.log("[SEED] Created admin user with id:", insertResult.rows[0]?.id);
     } else {
       const updateResult = await pool.query(
-        `UPDATE users SET password = $1, failed_login_attempts = 0, locked_until = NULL, password_changed_at = COALESCE(password_changed_at, NOW()), must_change_password = false WHERE email = $2`,
+        `UPDATE users SET password = $1, role = 'super_admin', failed_login_attempts = 0, locked_until = NULL, password_changed_at = COALESCE(password_changed_at, NOW()), must_change_password = false WHERE email = $2`,
         [hashed, ADMIN_EMAIL]
       );
       console.log("[SEED] Updated admin password, rows affected:", updateResult.rowCount);
