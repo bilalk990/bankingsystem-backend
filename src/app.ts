@@ -9,6 +9,8 @@ import { loginLimiter, apiLimiter } from "./middlewares";
 import { errorHandler } from "./middlewares";
 
 const app: Express = express();
+app.set("strict routing", false);
+app.set("case sensitive routing", false);
 
 const isProduction = process.env.NODE_ENV === "production";
 
@@ -59,8 +61,8 @@ app.use("/api", inputSanitizer);
 
 app.set("trust proxy", 1);
 
-app.use("/api/auth/login", loginLimiter);
-app.use("/api", apiLimiter);
+// app.use("/api/auth/login", loginLimiter);
+// app.use("/api", apiLimiter);
 
 app.use("/uploads", express.static(path.join(process.cwd(), "uploads")));
 app.use("/static", express.static(path.join(process.cwd(), "src/static")));
