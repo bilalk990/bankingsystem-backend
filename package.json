@@ -9,7 +9,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "db:push": "drizzle-kit push --config ./drizzle.config.ts",
     "db:push-force": "drizzle-kit push --force --config ./drizzle.config.ts",
-    "seed": "tsx ./src/scripts/seed.ts"
+    "seed": "tsx ./src/scripts/seed.ts",
+    "start": "node dist/index.cjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.78.0",
