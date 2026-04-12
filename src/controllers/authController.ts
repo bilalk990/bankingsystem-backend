@@ -86,8 +86,17 @@ function getLockoutDuration(attempts: number): { durationMs: number; label: stri
   return result;
 }
 
-router.post("/auth/login", async (req, res): Promise<void> => {
-  console.log("[LOGIN] Attempt received for:", req.body?.email);
+router.all("/auth/login", async (req, res): Promise<void> => {
+  console.log(`[LOGIN] ${req.method} attempt received for:`, req.body?.email);
+
+  if (req.method !== "POST") {
+    res.status(405).json({
+      error: `Diagnostic Error: Backend received a ${req.method} request instead of a POST. This indicates a network redirection or proxy issue.`,
+      receivedMethod: req.method,
+      suggestedFix: "Check frontend VITE_API_URL or Railway backend protocol (HTTP vs HTTPS)."
+    });
+    return;
+  }
   const parsed = LoginBody.safeParse(req.body);
   if (!parsed.success) {
     console.log("[LOGIN] Body parse failed:", parsed.error.message);
