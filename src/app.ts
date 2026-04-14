@@ -38,21 +38,35 @@ const envOrigin = process.env.CORS_ORIGIN;
 const allowedOrigins: string[] = [
   "https://bridge-cap.company",
   "https://www.bridge-cap.company",
+  "http://localhost:3003",
+  "http://localhost:3001",
+  "http://localhost:3002",
+  "http://localhost:3000",
 ];
 
 if (envOrigin) {
   envOrigin.split(",").forEach(o => allowedOrigins.push(o.trim()));
 }
 
+// Support for other platforms if needed
 if (process.env.REPLIT_DEV_DOMAIN) allowedOrigins.push(`https://${process.env.REPLIT_DEV_DOMAIN}`);
-if (process.env.REPL_SLUG) allowedOrigins.push(`https://${process.env.REPL_SLUG}.replit.app`);
-if (process.env.REPLIT_DOMAINS) {
-  process.env.REPLIT_DOMAINS.split(",").forEach(d => allowedOrigins.push(`https://${d.trim()}`));
-}
 
 app.use(cors({
   credentials: true,
-  origin: true,
+  origin: (origin, callback) => {
+    // Allow requests with no origin (like mobile apps or curl)
+    if (!origin) return callback(null, true);
+    
+    // In dev mode, be more permissive if needed
+    if (process.env.NODE_ENV !== "production") return callback(null, true);
+
+    if (allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      console.log('[CORS] Blocked origin:', origin);
+      callback(null, false);
+    }
+  },
 }));
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));

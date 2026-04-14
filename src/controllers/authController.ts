@@ -274,10 +274,11 @@ router.all("/auth/login", async (req, res): Promise<void> => {
 
   const cookieOptions = {
     httpOnly: true,
-    secure: isProduction || isReplit,
-    sameSite: (isReplit && !isProduction ? "none" : isProduction ? "strict" : "lax") as "none" | "strict" | "lax",
+    secure: false, // Set to false for local development
+    sameSite: "lax" as "lax",
     maxAge: SESSION_DURATION_MS,
     path: "/",
+    // Don't set domain for localhost - let browser handle it
   };
 
   res.cookie("sessionToken", sessionToken, cookieOptions);
@@ -301,6 +302,8 @@ router.all("/auth/login", async (req, res): Promise<void> => {
     }),
     mustChangePassword: user.mustChangePassword || false,
     passwordExpired,
+    sessionToken, // Include token in response for localStorage fallback
+    userId: user.id,
   });
 });
 
@@ -351,7 +354,11 @@ router.post("/auth/logout", async (req, res): Promise<void> => {
 
   const isProduction = process.env.NODE_ENV === "production";
   const isReplit = !!process.env.REPL_ID;
-  const clearOpts = { path: "/", secure: isProduction || isReplit, sameSite: (isReplit && !isProduction ? "none" : isProduction ? "strict" : "lax") as "none" | "strict" | "lax" };
+  const clearOpts = { 
+    path: "/", 
+    secure: false, 
+    sameSite: "lax" as "lax"
+  };
   res.clearCookie("sessionToken", clearOpts);
   res.clearCookie("userId", clearOpts);
   res.json({ message: "Logged out" });

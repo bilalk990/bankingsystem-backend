@@ -48,12 +48,29 @@ function mapUserRow(row: any) {
 }
 
 export async function requireAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
-  const userId = req.cookies?.userId;
-  const sessionToken = req.cookies?.sessionToken;
+  let userId: string | undefined;
+  let sessionToken: string | undefined;
+
+  // Try to get from cookies first
+  userId = req.cookies?.userId;
+  sessionToken = req.cookies?.sessionToken;
+
+  // Fallback: Check Authorization header
+  if (!sessionToken) {
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      sessionToken = authHeader.substring(7);
+      // Extract userId from query or header
+      userId = req.headers['x-user-id'] as string;
+    }
+  }
 
   if (!userId || !sessionToken) {
     const cookieKeys = req.cookies ? Object.keys(req.cookies) : [];
-    console.log(`[Auth] 401 no cookies for ${req.method} ${req.path} (cookies: ${cookieKeys.join(",") || "none"})`);
+    console.log(`[Auth Middleware] 401 Unauthorized for ${req.method} ${req.path}`);
+    console.log(`[Auth Middleware] Missing credentials: userId=${!!userId}, sessionToken=${!!sessionToken}`);
+    console.log(`[Auth Middleware] Available cookies: ${cookieKeys.join(", ") || "none"}`);
+    console.log(`[Auth Middleware] Authorization header: ${req.headers.authorization ? 'present' : 'missing'}`);
     res.status(401).json({ error: "Not authenticated" });
     return;
   }
@@ -66,12 +83,19 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
 
   const result = await pool.query(`SELECT * FROM users WHERE id = $1 LIMIT 1`, [parsedId]);
   const user = result.rows[0] ? mapUserRow(result.rows[0]) : null;
-  if (!user || !user.active) {
+  if (!user) {
+    console.log(`[Auth] 401 User not found in DB for ID: ${parsedId}`);
+    res.status(401).json({ error: "Not authenticated" });
+    return;
+  }
+  if (!user.active) {
+    console.log(`[Auth] 401 User deactivated: ${user.email}`);
     res.status(401).json({ error: "Not authenticated" });
     return;
   }
 
   if (!user.sessionToken || user.sessionToken !== sessionToken) {
+    console.log(`[Auth] 401 Session token mismatch for ${user.email}. Provided: ${sessionToken?.slice(0, 8)}... Expected: ${user.sessionToken?.slice(0, 8)}...`);
     res.status(401).json({ error: "Session expired. Please log in again." });
     return;
   }

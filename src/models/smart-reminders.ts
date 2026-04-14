@@ -5,7 +5,7 @@ import { leadsTable } from "./leads";
 export const smartRemindersTable = pgTable("smart_reminders", {
   id: serial("id").primaryKey(),
   userId: integer("user_id").notNull().references(() => usersTable.id),
-  leadId: integer("lead_id").references(() => leadsTable.id),
+  leadId: integer("lead_id").references(() => leadsTable.id, { onDelete: "cascade" }),
   type: text("type").notNull(),
   title: text("title").notNull(),
   message: text("message").notNull(),

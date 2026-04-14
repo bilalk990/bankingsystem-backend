@@ -23,6 +23,50 @@ export interface BankTemplate {
 
 const BANK_TEMPLATES: BankTemplate[] = [
   {
+    name: "First International Bank & Trust",
+    aliases: ["First International Bank & Trust", "FIBT"],
+    identifyPattern: /\bFIBT\.com\b|\bFirst\s+International\s+Bank\s+&\s+Trust\b/i,
+    dateFormats: [/(\d{1,2}\/\d{1,2}\/\d{2,4})/, /(\d{1,2}\/\d{1,2})/],
+    sectionHeaders: {
+      deposits: /Account\s+Summary/i,
+      withdrawals: /Account\s+Summary/i,
+    },
+    summaryPatterns: {
+      totalDeposits: [
+        /(\d+)\s+Credit\(s\)\s+This\s+Period\$?\s*([\d,]+\.\d{2})/i,
+      ],
+      totalWithdrawals: [
+        /(\d+)\s+Debit\(s\)\s+This\s+Period\$?\s*([\d,]+\.\d{2})/i,
+      ],
+    },
+    transactionLinePatterns: [
+      /^(\d{1,2}\/\d{1,2}\/\d{2,4})\s+(.+?)\s+\$?([\d,]+\.\d{2})\s*$/,
+    ],
+    columnLayout: "single",
+  },
+  {
+    name: "Eastern Michigan Bank",
+    aliases: ["Eastern Michigan Bank", "EASTERN MICHIGAN BANK"],
+    identifyPattern: /\bXXXXXXXX\d{4}\b/i,
+    dateFormats: [/(\d{1,2}\/\d{1,2}\/\d{2,4})/, /(\d{1,2}\/\d{1,2})/],
+    sectionHeaders: {
+      deposits: /DEPOSITS\s+AND\s+ADDITIONS/i,
+      withdrawals: /CHECKS\s+AND\s+WITHDRAWALS/i,
+    },
+    summaryPatterns: {
+      totalDeposits: [
+        /\b(\d+)\s+Deposits?\/Credits\s+\$?([\d,]+\.\d{2})/i,
+      ],
+      totalWithdrawals: [
+        /\b(\d+)\s+Checks?\/Debits\s+\$?([\d,]+\.\d{2})/i,
+      ],
+    },
+    transactionLinePatterns: [
+       /^(\d{1,2}\/\d{2})\s+([A-Z].+?)\s+([\d,]+\.\d{2})\s*$/,
+    ],
+    columnLayout: "single",
+  },
+  {
     name: "Chase",
     aliases: ["JPMorgan Chase", "Chase Bank", "JPMORGAN CHASE"],
     identifyPattern: /\bJPMorgan\s+Chase\b|\bChase\s+Bank\b|\bCHASE\s+(?:BANK|CREDIT|CHECKING|SAVINGS|BUSINESS|ACCOUNT|STATEMENT)\b/i,
@@ -1552,14 +1596,15 @@ const BANK_TEMPLATES: BankTemplate[] = [
 ];
 
 export function identifyBank(rawText: string): BankTemplate | null {
-  const matches: BankTemplate[] = [];
+  const patternMatches: BankTemplate[] = [];
   for (const template of BANK_TEMPLATES) {
     if (template.identifyPattern.test(rawText)) {
-      matches.push(template);
+      patternMatches.push(template);
     }
   }
-  if (matches.length === 0) return null;
-  if (matches.length === 1) return matches[0];
+
+  // If we have pattern matches, we ONLY consider those. 
+  const candidatePool = patternMatches.length > 0 ? patternMatches : BANK_TEMPLATES;
 
   const textLower = rawText.toLowerCase();
   const firstLines = rawText.split("\n").slice(0, 30).join("\n").toLowerCase();
@@ -1569,25 +1614,28 @@ export function identifyBank(rawText: string): BankTemplate | null {
     domainNames.add((m[1] || m[2] || m[3]).toLowerCase());
   }
 
-  const headerMatch = matches.find(t => {
-    const nameLower = t.name.toLowerCase();
-    const nameWords = nameLower.split(/\s+/);
-    if (firstLines.includes(nameLower)) return true;
+  const headerMatch = candidatePool.find(t => {
+    const nameMatch = new RegExp(`\\b${t.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(firstLines);
+    if (nameMatch) return true;
     for (const alias of (t.aliases || [])) {
-      if (firstLines.includes(alias.toLowerCase())) return true;
+      const aliasMatch = new RegExp(`\\b${alias.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(firstLines);
+      if (aliasMatch) return true;
       if (domainNames.has(alias.toLowerCase())) return true;
     }
-    if (nameWords.some(w => w.length >= 4 && domainNames.has(w))) return true;
     return false;
   });
   if (headerMatch) return headerMatch;
 
-  const nameMatch = matches.find(t => textLower.includes(t.name.toLowerCase()));
+  if (patternMatches.length > 0) {
+    return patternMatches[0];
+  }
+
+  const nameMatch = candidatePool.find(t => textLower.includes(t.name.toLowerCase()));
   if (nameMatch) return nameMatch;
-  const aliasMatch = matches.find(t => t.aliases?.some(a => textLower.includes(a.toLowerCase())));
+  const aliasMatch = candidatePool.find(t => t.aliases?.some(a => textLower.includes(a.toLowerCase())));
   if (aliasMatch) return aliasMatch;
-  const longestName = matches.reduce((best, t) => t.name.length > best.name.length ? t : best, matches[0]);
-  return longestName;
+  
+  return null;
 }
 
 export function findBankByName(bankName: string): BankTemplate | null {

@@ -716,7 +716,7 @@ function formatScrubData(revEntries: RevEntry[], loanEntries: LoanEntry[], forma
 
   parts.push(...uniqueLoans.values());
 
-  const olderKeys = sortedMonthKeys.slice(1, 3);
+  const olderKeys = sortedMonthKeys.slice(1, 12);
   for (const key of olderKeys) {
     const entries = revEntries.filter(e => e.sortKey === key);
     entries.sort((a, b) => b.rev - a.rev);
@@ -2651,24 +2651,32 @@ router.get("/scrubbing/detail/:leadId", requireAuth, requireAdmin, async (req, r
     const docInfos: DocInfo[] = [];
     for (const bs of bankStatements) {
       if (bs.type !== "bank_statement") continue;
-      let storedText = storedTextMap.get(bs.name.toLowerCase());
 
+      let storedText = "";
+      
+      // Look for the specific analysis row for this document ID
+      const linkedAnalysis = analyses.find(a => a.documentId === bs.id);
+      if (linkedAnalysis && linkedAnalysis.extractedStatementText) {
+        storedText = String(linkedAnalysis.extractedStatementText);
+      }
+
+      // Fallback for older multi-doc analyses where documentId might not be set:
       if (!storedText) {
         const bsLower = bs.name.toLowerCase().replace(/\.[^.]+$/, "");
-        for (const [key, val] of storedTextMap) {
-          const keyClean = key.replace(/\.[^.]+$/, "");
-          if (keyClean === bsLower || key.includes(bsLower) || bsLower.includes(keyClean)) {
-            storedText = val;
-            break;
+        storedText = storedTextMap.get(bsLower) || "";
+        if (!storedText) {
+          for (const [key, val] of storedTextMap) {
+            const keyClean = key.replace(/\.[^.]+$/, "");
+            if (keyClean === bsLower || key.includes(bsLower) || bsLower.includes(keyClean)) {
+              storedText = val;
+              break;
+            }
           }
         }
       }
 
-      if (!storedText && storedTextMap.size === 1) {
-        storedText = storedTextMap.values().next().value;
-      }
-
-      if (!storedText) {
+      // If there's ONLY ONE bank statement in total and we STILL couldn't map it, use the first available analysis text
+      if (!storedText && bankStatements.length === 1 && analyses.length >= 1) {
         for (const a of analyses) {
           if (a.extractedStatementText) {
             const fullText = String(a.extractedStatementText);
@@ -2704,12 +2712,13 @@ router.get("/scrubbing/detail/:leadId", requireAuth, requireAdmin, async (req, r
       }
 
       if (!month || !acct) {
-        const fnMatch = bs.name.match(/[_\-]([A-Za-z]{3})(\d{2})[_\-](\d{4})/);
+        const fnMatch = bs.name.match(/[_\-]?(?:BS)?([A-Za-z]{3})(20\d{2}|\d{2})[_\-Xx]+(\d{3,4})/i) || bs.name.match(/[_\-]([A-Za-z]{3})(\d{2})[_\-](\d{4})/i);
         if (fnMatch) {
           const fnMoWord = fnMatch[1].charAt(0).toUpperCase() + fnMatch[1].slice(1).toLowerCase();
           const moMap: Record<string, boolean> = { Jan:true,Feb:true,Mar:true,Apr:true,May:true,Jun:true,Jul:true,Aug:true,Sep:true,Oct:true,Nov:true,Dec:true };
           if (moMap[fnMoWord]) {
-            if (!month) { month = `${fnMoWord}${fnMatch[2]}`; if (!confidence || confidence === "low") confidence = "medium"; }
+            const yrStr = fnMatch[2].length === 4 ? fnMatch[2].slice(2) : fnMatch[2];
+            if (!month) { month = `${fnMoWord}${yrStr}`; if (!confidence || confidence === "low") confidence = "medium"; }
             if (!acct) acct = fnMatch[3];
           }
         }

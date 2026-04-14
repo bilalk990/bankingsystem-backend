@@ -3,3 +3,15 @@ dist/
 .env
 *.log
 .replit-artifact/
+uploads/
+check_*.ts
+debug_*.ts
+diag_*.ts
+test_*.ts
+*.txt
+scratch.ts
+verify_*.ts
+find_*.ts
+simulate_*.ts
+dump_*.ts
+trigger_*.ts

@@ -11,7 +11,7 @@ export const tasksTable = pgTable("tasks", {
   dueDate: timestamp("due_date", { withTimezone: true }),
   assignedToId: integer("assigned_to_id").references(() => usersTable.id),
   assignedById: integer("assigned_by_id").references(() => usersTable.id),
-  leadId: integer("lead_id").references(() => leadsTable.id),
+  leadId: integer("lead_id").references(() => leadsTable.id, { onDelete: "cascade" }),
   completedAt: timestamp("completed_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [

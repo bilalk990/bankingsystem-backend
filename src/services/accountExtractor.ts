@@ -50,6 +50,57 @@ const ACCOUNT_PATTERNS = [
   /(?:Account|Acct|Checking|Savings)\s*(?:No\.?|#|Number)?[:\s]*(\d{4,5}-\d{4})\s*\(\d\)/i,
 ];
 
+export function extractBusinessNameFromText(text: string): string | null {
+  const slice = text.slice(0, 3000);
+  // Look for common patterns where the account holder name appears
+  const patterns = [
+    /(?:Account\s+for|Statement\s+for|Customer\s+Name)[:\s]*\n?([A-Z0-9\s,&.]{3,60})/i,
+    /(?:^|\n)([A-Z0-9\s,&.]{3,60})\s*\n(?:[0-9]{1,5}\s+[A-Z0-9\s,.]{3,60})/i, // Name followed by address line
+    /([A-Z0-9\s,&.]{3,60})\n\s*(?:PO\s+BOX|P\.O\.\s+BOX)/i,
+  ];
+
+  for (const pat of patterns) {
+    const m = slice.match(pat);
+    if (m && m[1]) {
+      const name = m[1].trim();
+      if (name.length > 3 && !/Bank|Union|Statement|Page|Account/i.test(name)) {
+        return name;
+      }
+    }
+  }
+  
+  // Fallback: take the first non-empty lines that don't look like bank headers
+  const lines = slice.split('\n').map(l => l.trim()).filter(l => l.length > 5);
+  for (let i = 0; i < Math.min(lines.length, 10); i++) {
+    const line = lines[i];
+    if (/^[A-Z0-9\s,&.]{5,}$/.test(line) && !/Bank|National|Federal|Credit|Statement|Ending|Beginning|Balance|Page|Account|Date|Thru/i.test(line)) {
+      return line;
+    }
+  }
+
+  return null;
+}
+
+export function fuzzyBusinessMatch(name1: string, name2: string): number {
+  const n1 = name1.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const n2 = name2.toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (n1 === n2) return 100;
+  if (n1.includes(n2) || n2.includes(n1)) return 85;
+
+  let matches = 0;
+  const words1 = name1.toLowerCase().split(/\s+/).filter(w => w.length > 2);
+  const words2 = name2.toLowerCase().split(/\s+/).filter(w => w.length > 2);
+  for (const w1 of words1) {
+    for (const w2 of words2) {
+      if (w1 === w2) matches++;
+    }
+  }
+  if (words1.length > 0 && words2.length > 0) {
+    return Math.round((matches / Math.max(words1.length, words2.length)) * 100);
+  }
+  return 0;
+}
+
 const PHONE_PATTERN = /\d{3}[-.)\s]\d{3}[-.]\d{4}/;
 const BANK_ID_PATTERN = /[A-Z]{2}\d{3}\|[A-Z]{2}\d{3}\|\d+/;
 const ROUTING_PATTERN = /(?:routing|transit|aba)\s*(?:number|no\.?|#)?[:\s]*\d/i;

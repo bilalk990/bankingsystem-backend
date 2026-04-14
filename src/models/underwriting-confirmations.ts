@@ -7,7 +7,7 @@ import { bankStatementAnalysesTable } from "./bank-statement-analyses";
 export const underwritingConfirmationsTable = pgTable("underwriting_confirmations", {
   id: serial("id").primaryKey(),
   analysisId: integer("analysis_id").references(() => bankStatementAnalysesTable.id, { onDelete: "set null" }),
-  leadId: integer("lead_id").references(() => leadsTable.id, { onDelete: "set null" }),
+  leadId: integer("lead_id").references(() => leadsTable.id, { onDelete: "cascade" }),
   findingType: text("finding_type").notNull(),
   findingIndex: integer("finding_index").notNull(),
   originalValue: jsonb("original_value"),

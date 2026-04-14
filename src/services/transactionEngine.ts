@@ -54,7 +54,7 @@ const LENDER_PATTERNS: { pattern: RegExp; shortName: string }[] = [
   { pattern: /gmfunding|gm\s*funding/i, shortName: "gmfunding" },
   { pattern: /sq\s*advance|square\s*capital|sq\s*capital|sq\s*loan/i, shortName: "square" },
   { pattern: /\bw\s+funding\b/i, shortName: "wfunding" },
-  { pattern: /can\s*capital/i, shortName: "cancapital" },
+  { pattern: /\bcan\s*capital\b|\bcan\s*\d+\b|\bcan\b/i, shortName: "cancapital" },
   { pattern: /rapid\s*financ/i, shortName: "rapid" },
   { pattern: /credibly/i, shortName: "credibly" },
   { pattern: /libertas/i, shortName: "libertas" },
@@ -355,7 +355,7 @@ export function extractAllTransactions(rawText: string): TransactionEngineResult
 
   const skipLine = /^(?:Date\s+Description|Date\s+Ref|SUBTOTAL|TOTAL|BALANCE\s+FORWARD|continued\s+on|page\s+\d|beginning\s+balance|ending\s+balance|previous\s+balance|closing\s+balance|daily\s+(?:ending\s+)?balance|DAILY\s+BALANCE\s+DETAIL|\s*$)/i;
   const tableDataStartLine = /^--- TABLE DATA ---$/i;
-  const structuredDataLine = /^\[STRUCTURED_PARSED_DATA\]/i;
+  const structuredDataLine = /^(?:\[STRUCTURED_PARSED_DATA\]|---\s*VERIFIED\s*DATA)/i;
   const dailyBalanceSection = /DAILY\s+(?:ENDING\s+)?BALANCE/i;
   let inDailyBalance = false;
   let inTableData = false;
@@ -407,17 +407,16 @@ export function extractAllTransactions(rawText: string): TransactionEngineResult
       if (description.length < 2) break;
       if (/^(?:page|continued|subtotal|total|balance|daily\s+(?:ending\s+)?balance)/i.test(description)) break;
 
-      let amount: number;
+      let rawAmountStr = match[3].replace(/[$,]/g, "");
+      let amount = Math.abs(parseFloat(rawAmountStr));
       let balance: number | undefined;
 
       if (match[4]) {
-        amount = Math.abs(parseFloat(match[3].replace(/[$,]/g, "")));
         balance = parseFloat(match[4].replace(/[$,]/g, ""));
-      } else {
-        amount = Math.abs(parseFloat(match[3].replace(/[$,]/g, "")));
       }
 
       if (isNaN(amount) || amount === 0 || amount > 100_000_000) break;
+
 
       if (i + 1 < lines.length) {
         const nextLine = lines[i + 1].trim();

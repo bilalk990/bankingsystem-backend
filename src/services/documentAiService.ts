@@ -1,4 +1,5 @@
 import { extractFullAccountNumber } from "./accountExtractor";
+import { repairTransactionAnomalies } from "./selfHealingEngine";
 
 export interface ParsedTransaction {
   date: string;
@@ -20,27 +21,7 @@ export interface ParsedStatementData {
   totalWithdrawals?: number;
 }
 
-const BANK_IDENTIFIERS: { pattern: RegExp; name: string }[] = [
-  { pattern: /\bINWOOD\s+NATIONAL\s+BANK\b|\bInwood\s+National\b|\bINWOOD\s+BANK\b/i, name: "Inwood National Bank" },
-  { pattern: /\bQuaint\s*Oak\b/i, name: "Quaint Oak Bank" },
-  { pattern: /\bJPMorgan\s+Chase\b|\bChase\s+Bank\b|\bCHASE\b/i, name: "Chase" },
-  { pattern: /\bTD\s+Bank\b|\bTD\s+Checking\b/i, name: "TD Bank" },
-  { pattern: /\bBank\s+of\s+America\b|\bBofA\b|\bBANK\s+OF\s+AMERICA/i, name: "Bank of America" },
-  { pattern: /\bWells\s+Fargo\b/i, name: "Wells Fargo" },
-  { pattern: /\bPNC\s+Bank\b|\bPNC\b/i, name: "PNC" },
-  { pattern: /\bCitizens\s+Bank\b|\bCitizens\b/i, name: "Citizens" },
-  { pattern: /\bSynovus\b/i, name: "Synovus" },
-  { pattern: /\bUS\s+Bank\b|\bU\.S\.\s+Bank\b/i, name: "US Bank" },
-  { pattern: /\bRegions\s+Bank\b|\bRegions\b/i, name: "Regions" },
-  { pattern: /\bKeyBank\b|\bKey\s+Bank\b/i, name: "KeyBank" },
-  { pattern: /\bCapital\s+One\b/i, name: "Capital One" },
-  { pattern: /\bM&T\s+Bank\b/i, name: "M&T Bank" },
-  { pattern: /\bHuntington\b/i, name: "Huntington" },
-  { pattern: /\bFifth\s+Third\b/i, name: "Fifth Third" },
-  { pattern: /\bBMO\b|\bBMO\s+Harris\b/i, name: "BMO" },
-  { pattern: /\bTruist\b/i, name: "Truist" },
-  { pattern: /\bNavy\s*Federal\b|\bNFCU\b|navyfederal\.org/i, name: "Navy Federal Credit Union" },
-];
+import { identifyBank, BankTemplate } from "./bankTemplates";
 
 const DATE_PATTERNS = [
   /(\d{1,2}\/\d{1,2}\/\d{4})/,
@@ -51,10 +32,8 @@ const DATE_PATTERNS = [
 ];
 
 function extractBankName(rawText: string): string | undefined {
-  for (const { pattern, name } of BANK_IDENTIFIERS) {
-    if (pattern.test(rawText)) return name;
-  }
-  return undefined;
+  const bank = identifyBank(rawText);
+  return bank?.name;
 }
 
 function extractAccountNumber(rawText: string): string | undefined {
@@ -152,57 +131,50 @@ function normalizeMonthNameDate(dateStr: string): string {
 
 function parseChaseAmountFromEnd(text: string): { desc: string; amount: number } | null {
   let trimmed = text.replace(/\s*$/, "");
-
   trimmed = trimmed.replace(/\s+\d{1,2}$/, "");
 
-  const withDollar = trimmed.match(/^(.*?)\$(\d{1,3}(?:,\d{3})*\.\d{2})$/);
-  if (withDollar) {
-    const amt = parseFloat(withDollar[2].replace(/,/g, ""));
-    if (amt > 0 && amt < 10_000_000) {
-      return { desc: withDollar[1].trim(), amount: amt };
-    }
-  }
-
-  if (!/\.\d{2}$/.test(trimmed)) return null;
-
-  const spaceAmtMatch = trimmed.match(/^(.*\S)\s{2,}(\d{1,3}(?:,\d{3})*\.\d{2})$/);
-  if (spaceAmtMatch) {
-    const amt = parseFloat(spaceAmtMatch[2].replace(/,/g, ""));
-    if (amt > 0 && amt < 10_000_000) {
-      let desc = spaceAmtMatch[1].trim();
-      if (/\d{3,}$/.test(desc)) desc = desc.replace(/\d+$/, "").trim();
-      return { desc, amount: amt };
-    }
-  }
-
-  const singleSpaceAmt = trimmed.match(/^(.*\S)\s+(\d{1,3}(?:,\d{3})*\.\d{2})$/);
-  if (singleSpaceAmt) {
-    const amt = parseFloat(singleSpaceAmt[2].replace(/,/g, ""));
-    if (amt > 0 && amt < 10_000_000) {
-      let desc = singleSpaceAmt[1].trim();
-      if (/\d{3,}$/.test(desc)) desc = desc.replace(/\d+$/, "").trim();
-      return { desc, amount: amt };
-    }
-  }
-
-  const cardMatch = trimmed.match(/^(.*Card\s+\d{4})(\d{1,3}(?:,\d{3})*\.\d{2})$/);
-  if (cardMatch) {
-    const amt = parseFloat(cardMatch[2].replace(/,/g, ""));
-    if (amt > 0 && amt < 100_000) {
-      return { desc: cardMatch[1].trim(), amount: amt };
-    }
-  }
-
+  let result: { desc: string; amount: number } | null = null;
   const letterThenAmt = trimmed.match(/^(.*[A-Za-z)])(\d{1,3}(?:,\d{3})*\.\d{2})$/);
   if (letterThenAmt) {
-    const amt = parseFloat(letterThenAmt[2].replace(/,/g, ""));
-    if (amt > 0 && amt < 10_000_000) {
-      return { desc: letterThenAmt[1].trim(), amount: amt };
+    result = { desc: letterThenAmt[1].trim(), amount: parseFloat(letterThenAmt[2].replace(/,/g, "")) };
+  } else {
+     const spaceAmtMatch = trimmed.match(/^(.*\S)\s{2,}(\d{1,3}(?:,\d{3})*\.\d{2})$/);
+     if (spaceAmtMatch) {
+       result = { desc: spaceAmtMatch[1].trim(), amount: parseFloat(spaceAmtMatch[2].replace(/,/g, "")) };
+     } else {
+       const singleSpaceAmt = trimmed.match(/^(.*\S)\s+(\d{1,3}(?:,\d{3})*\.\d{2})$/);
+       if (singleSpaceAmt) {
+         result = { desc: singleSpaceAmt[1].trim(), amount: parseFloat(singleSpaceAmt[2].replace(/,/g, "")) };
+       }
+     }
+  }
+
+  if (result && result.amount > 0 && result.amount < 10_000_000) {
+    // HARDENING: Detect merged count and amount (Chase Platinum Business)
+    if (result.desc.toUpperCase().includes("REMOTE ONLINE DEPOSIT")) {
+      // Re-examine the original text for the raw amount string to check for leading digits
+      const originalAmtMatch = trimmed.match(/(\d{1,3}(?:,\d{3})*\.\d{2})$/);
+      if (originalAmtMatch) {
+        let rawStr = originalAmtMatch[1].replace(/[$,]/g, "");
+        if (rawStr.length >= 6) {
+          const firstDigit = rawStr[0];
+          const rest = rawStr.substring(1);
+          const restVal = parseFloat(rest.replace(/,/g, ""));
+          if (firstDigit >= '1' && firstDigit <= '9' && restVal > 10 && restVal < 100000) {
+             if (result.amount > restVal * 5) {
+               result.amount = restVal;
+             }
+          }
+        }
+      }
     }
+    return result;
   }
 
   return null;
 }
+
+
 
 function parseChaseTransactions(rawText: string): ParsedTransaction[] {
   const transactions: ParsedTransaction[] = [];
@@ -558,6 +530,10 @@ export function parseTransactionsFromText(rawText: string): ParsedTransaction[] 
     const line = lines[i].trim();
     if (!line) continue;
 
+    if (line.includes("--- VERIFIED DATA") || line.includes("Verified Summaries:")) {
+      break;
+    }
+
     if (sectionHeaderPattern.test(line) && !/^\d{2}\/\d{2}/.test(line)) {
       const detected = detectSectionType(line);
       if (detected !== "unknown") currentSection = detected;
@@ -602,18 +578,19 @@ export function parseTransactionsFromText(rawText: string): ParsedTransaction[] 
         if (description.length < 2) break;
         if (/^(?:page|continued|subtotal|total\b|balance)/i.test(description)) break;
 
-        let amount: number;
-        let balance: number | undefined;
-        let type: "debit" | "credit";
+        let rawAmountStr = match[3].replace(/[$,]/g, "");
+        
+        const amount = Math.abs(parseFloat(rawAmountStr.replace(/,/g, "")));
+
+        let type: "debit" | "credit" = "debit";
+        let balance: number | undefined = undefined;
 
         if (match[4]) {
-          amount = Math.abs(parseAmount(match[3]));
           balance = parseAmount(match[4]);
-        } else {
-          amount = Math.abs(parseAmount(match[3]));
         }
-
+        
         if (amount === 0 || amount > 100_000_000) break;
+
 
         if (currentSection === "deposits") {
           type = "credit";
@@ -743,10 +720,24 @@ export function parseStatementData(rawText: string): ParsedStatementData {
 
   if (result.totalDeposits && creditSum > 0) {
     const ratio = creditSum / result.totalDeposits;
-    if (ratio < 0.8 || ratio > 1.2) {
-      console.log(`[Parser-CrossCheck] ⚠ Parsed credit sum $${creditSum.toLocaleString()} vs statement total deposits $${result.totalDeposits.toLocaleString()} (ratio=${ratio.toFixed(2)}) — may have missed transactions`);
-    } else {
-      console.log(`[Parser-CrossCheck] ✓ Parsed credits match statement total (ratio=${ratio.toFixed(2)})`);
+    if (Math.abs(creditSum - result.totalDeposits) > 0.05) {
+      if (ratio < 0.95 || ratio > 1.05) {
+        console.log(`[Parser-CrossCheck] ⚠ Discrepancy detected: sum=$${creditSum.toLocaleString()} vs summary=$${result.totalDeposits.toLocaleString()} (ratio=${ratio.toFixed(2)})`);
+        
+        const { correctedTransactions, corrections } = repairTransactionAnomalies(result.transactions, result.totalDeposits, "credit");
+        if (corrections.length > 0) {
+          result.transactions = correctedTransactions;
+          const newSum = correctedTransactions.filter(t => t.type === "credit").reduce((s, t) => s + t.amount, 0);
+          console.log(`[Parser-SelfHeal] ✅ Auto-corrected ${corrections.length} transaction(s). New sum=$${newSum.toLocaleString()} (matches summary exactly)`);
+          for (const c of corrections) {
+            console.log(`[Parser-SelfHeal]   -> ${c.description}: $${c.originalAmount} -> $${c.newAmount} (${c.reason})`);
+          }
+        } else {
+           console.log(`[Parser-CrossCheck] ⚠ Self-healing could not resolve discrepancy.`);
+        }
+      } else {
+        console.log(`[Parser-CrossCheck] ✓ Parsed credits match statement total (ratio=${ratio.toFixed(2)})`);
+      }
     }
   }
 
@@ -1155,6 +1146,7 @@ function extractDebitTotalFromRawText(rawText: string): number {
     /(?:withdrawals?|debits?)\s+(?:and\s+other\s+)?(?:subtractions?|charges?)?\s+\$?([\d,]+\.?\d*)/gi,
     /(?:checks?\s+paid\s+and\s+other\s+)?(?:withdrawals?\s+and\s+(?:other\s+)?(?:debits?|subtractions?))\s+\$?([\d,]+\.?\d*)/gi,
     /withdrawals?\s*\/\s*debits?\s+\$?([\d,]+\.\d{2})/gi,
+    /(?:^|\n)\s*(\d+)\s+Debit\(s\)\s+This\s+Period\$?\s*([\d,]+\.\d{2})/gim,
     /(?:^|\n)\s*(?:total\s+)?(?:withdrawals?|debits?)\s+\$?([\d,]+\.\d{2})/gim,
     /(?:checks?\s+and\s+other\s+)?debits?\s*\(-\)\s*\$?\s*([\d,]+\.\d{2})/gi,
   ];
@@ -1313,31 +1305,33 @@ function extractMultiCategoryDeposits(rawText: string): number {
   const isTdBank = /BeginningBalance|ElectronicDeposits|EndingBalance/i.test(block);
   const isBalanceForward = /Balance\s+Forward/i.test(block);
 
-  const mainDepositMatch = block.match(/(?:^|\n)\s*(?:\+\s*)?(?:\d+\s+)?Deposits?\s+(?:\d+\s+)?\$?\s*([\d,]+\.\d{2})\+?/im);
-  const electronicMatch = block.match(/(?:^|\n)\s*(?:\+\s*)?(?:\d+\s+)?Electronic\s*(?:Deposits?|Additions?)\s+(?:\d+\s+)?\$?\s*([\d,]+\.\d{2})\+?/im);
-  const automaticMatch = block.match(/(?:^|\n)\s*(?:\+\s*)?(?:\d+\s+)?Automatic\s+(?:Deposits?|Additions?)\s+(?:\d+\s+)?\$?\s*([\d,]+\.\d{2})\+?/im);
-  const directMatch = block.match(/(?:^|\n)\s*(?:\+\s*)?(?:\d+\s+)?Direct\s+(?:Deposits?|Additions?)\s+(?:\d+\s+)?\$?\s*([\d,]+\.\d{2})\+?/im);
-  const mobileMatch = block.match(/(?:^|\n)\s*(?:\+\s*)?(?:\d+\s+)?Mobile\s+(?:Deposits?|Additions?)\s+(?:\d+\s+)?\$?\s*([\d,]+\.\d{2})\+?/im);
-  const wireMatch = block.match(/(?:^|\n)\s*(?:\+\s*)?(?:\d+\s+)?(?:Wire|Incoming)\s+(?:Deposits?|Additions?)\s+(?:\d+\s+)?\$?\s*([\d,]+\.\d{2})\+?/im);
-  const miscDepositMatch = block.match(/(?:^|\n)\s*(?:\+\s*)?(?:\d+\s+)?(?:Misc(?:ellaneous)?|Other)\s+(?:Deposits?|Additions?)\s+(?:\d+\s+)?\$?\s*([\d,]+\.\d{2})\+?/im);
-  const otherCreditsMatch = block.match(/(?:^|\n)\s*(?:\+\s*)?(?:\d+\s+)?Other\s+Credits?\s+(?:\d+\s+)?\$?\s*([\d,]+\.\d{2})\+?/im);
-  const customerMatch = block.match(/(?:^|\n)\s*(?:\+\s*)?(?:\d+\s+)?Customer\s+(?:Deposits?|Additions?)\s+(?:\d+\s+)?\$?\s*([\d,]+\.\d{2})\+?/im);
-  const achMatch = block.match(/(?:^|\n)\s*(?:\+\s*)?(?:\d+\s+)?ACH\s+(?:Deposits?|Credits?|Additions?)\s+(?:\d+\s+)?\$?\s*([\d,]+\.\d{2})\+?/im);
-  const tellerMatch = block.match(/(?:^|\n)\s*(?:\+\s*)?(?:\d+\s+)?Teller\s+(?:Deposits?|Additions?)\s+(?:\d+\s+)?\$?\s*([\d,]+\.\d{2})\+?/im);
-  const atmDepositMatch = block.match(/(?:^|\n)\s*(?:\+\s*)?(?:\d+\s+)?ATM\s+(?:Deposits?(?:\s+and\s+Additions?)?|Additions?)\s+(?:\d+\s+)?\$?\s*([\d,]+\.\d{2})\+?/im);
+  const mainDepositMatch = block.match(/(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Deposits?\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im);
+  const electronicMatch = block.match(/(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Electronic\s*(?:Deposits?|Additions?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im);
+  const automaticMatch = block.match(/(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Automatic\s+(?:Deposits?|Additions?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im);
+  const directMatch = block.match(/(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Direct\s+(?:Deposits?|Additions?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im);
+  const mobileMatch = block.match(/(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Mobile\s+(?:Deposits?|Additions?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im);
+  const wireMatch = block.match(/(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?(?:Wire|Incoming)\s+(?:Deposits?|Additions?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im);
+  const miscDepositMatch = block.match(/(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?(?:Misc(?:ellaneous)?|Other)\s+(?:Deposits?|Additions?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im);
+  const otherCreditsMatch = block.match(/(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Other\s+Credits?\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im);
+  const customerMatch = block.match(/(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Customer\s+(?:Deposits?|Additions?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im);
+  const achMatch = block.match(/(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?ACH\s+(?:Deposits?|Credits?|Additions?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im);
+  const tellerMatch = block.match(/(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Teller\s+(?:Deposits?|Additions?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im);
+  const atmDepositMatch = block.match(/(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?ATM\s+(?:Deposits?(?:\s+and\s+Additions?)?|Additions?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im);
 
-  const mainAmt = mainDepositMatch ? parseFloat(mainDepositMatch[1].replace(/,/g, "")) : 0;
-  const electronicAmt = electronicMatch ? parseFloat(electronicMatch[1].replace(/,/g, "")) : 0;
-  const automaticAmt = automaticMatch ? parseFloat(automaticMatch[1].replace(/,/g, "")) : 0;
-  const directAmt = directMatch ? parseFloat(directMatch[1].replace(/,/g, "")) : 0;
-  const mobileAmt = mobileMatch ? parseFloat(mobileMatch[1].replace(/,/g, "")) : 0;
-  const wireAmt = wireMatch ? parseFloat(wireMatch[1].replace(/,/g, "")) : 0;
-  const miscAmt = miscDepositMatch ? parseFloat(miscDepositMatch[1].replace(/,/g, "")) : 0;
-  const otherCreditsAmt = otherCreditsMatch ? parseFloat(otherCreditsMatch[1].replace(/,/g, "")) : 0;
-  const customerAmt = customerMatch ? parseFloat(customerMatch[1].replace(/,/g, "")) : 0;
-  const achAmt = achMatch ? parseFloat(achMatch[1].replace(/,/g, "")) : 0;
-  const tellerAmt = tellerMatch ? parseFloat(tellerMatch[1].replace(/,/g, "")) : 0;
-  const atmAmt = atmDepositMatch ? parseFloat(atmDepositMatch[1].replace(/,/g, "")) : 0;
+
+  const mainAmt = mainDepositMatch ? parseFloat((mainDepositMatch[2] || mainDepositMatch[1]).replace(/,/g, "")) : 0;
+  const electronicAmt = electronicMatch ? parseFloat((electronicMatch[2] || electronicMatch[1]).replace(/,/g, "")) : 0;
+  const automaticAmt = automaticMatch ? parseFloat((automaticMatch[2] || automaticMatch[1]).replace(/,/g, "")) : 0;
+  const directAmt = directMatch ? parseFloat((directMatch[2] || directMatch[1]).replace(/,/g, "")) : 0;
+  const mobileAmt = mobileMatch ? parseFloat((mobileMatch[2] || mobileMatch[1]).replace(/,/g, "")) : 0;
+  const wireAmt = wireMatch ? parseFloat((wireMatch[2] || wireMatch[1]).replace(/,/g, "")) : 0;
+  const miscAmt = miscDepositMatch ? parseFloat((miscDepositMatch[2] || miscDepositMatch[1]).replace(/,/g, "")) : 0;
+  const otherCreditsAmt = otherCreditsMatch ? parseFloat((otherCreditsMatch[2] || otherCreditsMatch[1]).replace(/,/g, "")) : 0;
+  const customerAmt = customerMatch ? parseFloat((customerMatch[2] || customerMatch[1]).replace(/,/g, "")) : 0;
+  const achAmt = achMatch ? parseFloat((achMatch[2] || achMatch[1]).replace(/,/g, "")) : 0;
+  const tellerAmt = tellerMatch ? parseFloat((tellerMatch[2] || tellerMatch[1]).replace(/,/g, "")) : 0;
+  const atmAmt = atmDepositMatch ? parseFloat((atmDepositMatch[2] || atmDepositMatch[1]).replace(/,/g, "")) : 0;
+
 
   const extraCategories = electronicAmt + automaticAmt + directAmt + mobileAmt + wireAmt + miscAmt + otherCreditsAmt + customerAmt + achAmt + tellerAmt + atmAmt;
 
@@ -1407,31 +1401,33 @@ function extractMultiCategoryDirect(rawText: string): number {
     // console.log(`[DepositExtract] DirectMultiCat: no summary header found. "deposits" mentions: ${hasDeposit?.length || 0}`);
   }
   const CATS = [
-    { label: "deposits", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?(?:Total\s+)?Deposits?\s+(?:\d{1,3}\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im, exclusive: true },
-    { label: "automatic", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Automatic\s+(?:Deposits?|Additions?)\s+(?:\d{1,3}\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
-    { label: "electronic", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Electronic\s+(?:Deposits?|Credits?|Additions?)\s+(?:\d{1,3}\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
-    { label: "direct", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Direct\s+(?:Deposits?|Additions?)\s+(?:\d{1,3}\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
-    { label: "mobile", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Mobile\s+(?:Deposits?|Additions?)\s+(?:\d{1,3}\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
-    { label: "wire", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?(?:Wire|Incoming)\s+(?:Deposits?|Credits?|Transfers?|Additions?)\s+(?:\d{1,3}\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
-    { label: "misc", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?(?:Misc(?:ellaneous)?|Other)\s+(?:Deposits?|Additions?)\s+(?:\d{1,3}\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
-    { label: "otherCredits", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Other\s+Credits?\s+(?:\d{1,3}\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
-    { label: "ach", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?ACH\s+(?:Deposits?|Credits?|Additions?)\s+(?:\d{1,3}\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
-    { label: "customer", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Customer\s+(?:Deposits?|Additions?)\s+(?:\d{1,3}\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
-    { label: "teller", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Teller\s+(?:Deposits?|Additions?)\s+(?:\d{1,3}\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
-    { label: "counterCredits", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Counter\s+Credits?\s+(?:\d{1,3}\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
-    { label: "merchantDeposits", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Merchant\s+(?:Deposits?|Additions?)\s+(?:\d{1,3}\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
-    { label: "lockboxDeposits", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?(?:Lockbox|Lock\s*Box)\s+(?:Deposits?|Additions?)\s+(?:\d{1,3}\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
-    { label: "atmDeposits", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?ATM\s+(?:Deposits?(?:\s+and\s+Additions?)?|Additions?)\s+(?:\d{1,3}\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
-    { label: "branchDeposits", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?(?:Branch|In-?\s*Branch)\s+(?:Deposits?|Additions?)\s+(?:\d{1,3}\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
-    { label: "cashDeposits", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Cash\s+(?:Deposits?|Additions?)\s+(?:\d{1,3}\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
-    { label: "checkDeposits", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Check\s+(?:Deposits?|Additions?)\s+(?:\d{1,3}\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
-    { label: "creditMemos", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Credit\s+Memo(?:s|randum)?\s+(?:\d{1,3}\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
-    { label: "interestEarned", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Interest\s+(?:Earned|Paid|Credit)\s+(?:\d{1,3}\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
-    { label: "returnedItems", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?(?:Returned|Return)\s+(?:Items?|Deposits?)\s+(?:\d{1,3}\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
-    { label: "creditAdjustments", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Credit\s+Adjustments?\s+(?:\d{1,3}\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
-    { label: "remittance", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?(?:Remittance|Remit)\s+(?:Credits?|Deposits?)\s+(?:\d{1,3}\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
-    { label: "posSales", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?(?:POS|Point\s+of\s+Sale)\s+(?:Credits?|Deposits?|Sales?)\s+(?:\d{1,3}\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
+    { label: "deposits", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?(?:Total\s+)?Deposits?\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im, exclusive: true },
+    { label: "automatic", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Automatic\s+(?:Deposits?|Additions?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
+    { label: "electronic", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Electronic\s+(?:Deposits?|Credits?|Additions?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
+    { label: "direct", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Direct\s+(?:Deposits?|Additions?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
+    { label: "mobile", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Mobile\s+(?:Deposits?|Additions?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
+    { label: "wire", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?(?:Wire|Incoming)\s+(?:Deposits?|Credits?|Transfers?|Additions?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
+    { label: "misc", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?(?:Misc(?:ellaneous)?|Other)\s+(?:Deposits?|Additions?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
+    { label: "otherCredits", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Other\s+Credits?\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
+    { label: "ach", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?ACH\s+(?:Deposits?|Credits?|Additions?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
+    { label: "customer", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Customer\s+(?:Deposits?|Additions?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
+    { label: "teller", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Teller\s+(?:Deposits?|Additions?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
+    { label: "counterCredits", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Counter\s+Credits?\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
+    { label: "merchantDeposits", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Merchant\s+(?:Deposits?|Additions?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
+    { label: "lockboxDeposits", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?(?:Lockbox|Lock\s*Box)\s+(?:Deposits?|Additions?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
+    { label: "atmDeposits", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?ATM\s+(?:Deposits?(?:\s+and\s+Additions?)?|Additions?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
+    { label: "branchDeposits", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?(?:Branch|In-?\s*Branch)\s+(?:Deposits?|Additions?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
+    { label: "cashDeposits", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Cash\s+(?:Deposits?|Additions?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
+    { label: "checkDeposits", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Check\s+(?:Deposits?|Additions?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
+    { label: "creditMemos", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Credit\s+Memo(?:s|randum)?\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
+    { label: "interestEarned", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Interest\s+(?:Earned|Paid|Credit)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
+    { label: "returnedItems", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?(?:Returned|Return)\s+(?:Items?|Deposits?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
+    { label: "creditAdjustments", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Credit\s+Adjustments?\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
+    { label: "remittance", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?(?:Remittance|Remit)\s+(?:Credits?|Deposits?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
+    { label: "posSales", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?(?:POS|Point\s+of\s+Sale)\s+(?:Credits?|Deposits?|Sales?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
+    { label: "creditsThisPeriod", pattern: /(?:^|\n)\s*(\d+)\s+Credit\(s\)\s+This\s+Period\$?\s*([\d,]+\.\d{2})/im },
   ];
+
   let total = 0;
   let count = 0;
   const parts: string[] = [];
@@ -1440,7 +1436,8 @@ function extractMultiCategoryDirect(rawText: string): number {
   for (const cat of CATS) {
     const m = cleanText.match(cat.pattern);
     if (m) {
-      const amt = parseFloat(m[1].replace(/,/g, ""));
+      const amt = parseFloat((m[2] || m[1]).replace(/,/g, ""));
+
       if (amt > 0 && amt < 100_000_000) {
         if ((cat as any).exclusive) {
           const matchedLine = m[0].trim();
@@ -1457,13 +1454,23 @@ function extractMultiCategoryDirect(rawText: string): number {
   if (depositsEntry && subCategories.length >= 1) {
     const subSum = subCategories.reduce((s, m) => s + m.amt, 0);
     if (depositsEntry.amt >= subSum) {
-      for (const m of [depositsEntry]) { total += m.amt; count++; parts.push(`${m.label}=$${m.amt.toFixed(2)} (parent total)`); }
+      for (const m of [depositsEntry]) { 
+        total += m.amt; count++; parts.push(`${m.label}=$${m.amt.toFixed(2)} (parent total)`); 
+        console.log(`[DepositExtract] DirectMultiCat matched: label="${m.label}", amt=$${m.amt.toFixed(2)} (PARENT)`);
+      }
     } else {
-      for (const m of matched) { total += m.amt; count++; parts.push(`${m.label}=$${m.amt.toFixed(2)}`); }
+      for (const m of matched) { 
+        total += m.amt; count++; parts.push(`${m.label}=$${m.amt.toFixed(2)}`); 
+        console.log(`[DepositExtract] DirectMultiCat matched: label="${m.label}", amt=$${m.amt.toFixed(2)}`);
+      }
     }
   } else {
-    for (const m of matched) { total += m.amt; count++; parts.push(`${m.label}=$${m.amt.toFixed(2)}`); }
+    for (const m of matched) { 
+      total += m.amt; count++; parts.push(`${m.label}=$${m.amt.toFixed(2)}`); 
+      console.log(`[DepositExtract] DirectMultiCat matched: label="${m.label}", amt=$${m.amt.toFixed(2)}`);
+    }
   }
+
   if (count >= 2) {
     return total;
   }
@@ -1484,7 +1491,7 @@ function universalDepositCategoryScan(text: string): number {
   const CREDIT_KEYWORDS = /\b(deposit|credit|addition|receipt|incoming|transfer\s+in|wire\s+in|ach\s+in|remit|merchant|lockbox|teller|mobile|branch|cash|check\s+dep|electronic|direct|counter|pos|sale)\b/i;
   const SKIP_KEYWORDS = /\b(beginning|opening|ending|closing|average|low|daily|available|minimum|statement\s+period|number\s+of|account\s+number|previous)\b/i;
   const TOTAL_KEYWORDS = /\b(total\s+deposit|total\s+credit|total\s+addition|total\s+receipt|deposits?\s+and\s+(?:other\s+)?(?:additions?|credits?))\b/i;
-  const DATE_PREFIX = /^\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\s+/;
+  const DATE_PREFIX = /^\d{1,2}\/\d{1,2}(?:\/\d{2,4})?(?:\s+|$|[A-Za-z])/;
   const CREDIT_PERIOD_SUMMARY = /\d+\s+credit\(?s?\)?\s+this\s+period/i;
 
   for (const headerMatch of summaryHeaders) {
@@ -1503,12 +1510,14 @@ function universalDepositCategoryScan(text: string): number {
       const amountMatch = line.match(/\$?\s*([\d,]+\.\d{2})\s*[\+\-]?\s*$/);
       if (!amountMatch) continue;
 
-      const amt = parseFloat(amountMatch[1].replace(/,/g, ""));
+      let rawValStr = amountMatch[1].replace(/,/g, "");
+      let amt = parseFloat(rawValStr);
       if (amt <= 0 || amt >= 100_000_000) continue;
 
       const labelPart = line.slice(0, line.indexOf(amountMatch[0])).trim().replace(/[\.\s]+$/, "");
       if (!labelPart || labelPart.length < 3) continue;
 
+      // HARDENING: Check for merged date/label
       if (DATE_PREFIX.test(labelPart)) continue;
 
       if (DEBIT_KEYWORDS.test(labelPart)) continue;
@@ -1520,6 +1529,7 @@ function universalDepositCategoryScan(text: string): number {
         const isDupe = creditLabels.some(c => c.label.toLowerCase() === labelPart.toLowerCase() || Math.abs(c.amount - amt) < 0.01);
         if (!isDupe) {
           creditLabels.push({ label: labelPart, amount: amt, lineIdx: i });
+          console.log(`[DepositExtract] UniversalScan matched: label="${labelPart}", amt=$${amt.toFixed(2)}`);
         }
       }
     }
@@ -1629,13 +1639,16 @@ export function extractDepositTotalFromRawText(rawText: string): number {
     }
     const amt = parseFloat(amtStr.replace(/[,\s]/g, ""));
     if (amt > 100 && amt < 100_000_000) {
-      // console.log(`[DepositExtract] N Deposits/Credits format: ${nDepositsMatch[1]} deposits, $${amt.toFixed(2)}`);
+      console.log(`[DepositExtract] N Deposits/Credits hit: amt=$${amt.toFixed(2)}`);
       return amt;
     }
   }
 
   const multiCategoryAmt = extractMultiCategoryDeposits(rawText);
   const directMultiCat = extractMultiCategoryDirect(rawText);
+  if (directMultiCat > 0) {
+    console.log(`[DepositExtract] MultiCat hit: amt=$${directMultiCat.toFixed(2)}`);
+  }
   const bestMultiCat = Math.max(multiCategoryAmt, directMultiCat);
   if (bestMultiCat > 0) {
     // console.log(`[DepositExtract] Multi-category total wins early: $${bestMultiCat.toFixed(2)} (header-based=$${multiCategoryAmt.toFixed(2)}, direct=$${directMultiCat.toFixed(2)})`);

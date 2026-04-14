@@ -9,7 +9,13 @@ import { parseStatementData, formatParsedDataForPrompt } from "../../services/do
 import { extractAllTransactions, extractFromParsedTransactions, TransactionEngineResult, normalizeLenderName, areSameLender, deduplicateLoansAcrossAccounts, consolidateSameLenderEntries } from "../../services/transactionEngine";
 import { identifyBank, findBankByName } from "../../services/bankTemplates";
 import { scrubTracesTable, type TraceData, type StageA, type StageB, type StageC, type StageD, type StageE, type StageF, type NumericSource, type TraceSummary, type StageCCandidate, type StageDRow, type StageECandidate, type StageFEntry } from "../../models/scrub-traces";
-import { extractAccountLast4, extractAccountFromFilename, extractAllAccountLast4s } from "../../services/accountExtractor";
+import {
+  extractAccountLast4,
+  extractAccountFromFilename,
+  extractAllAccountLast4s,
+  extractBusinessNameFromText,
+  fuzzyBusinessMatch
+} from "../../services/accountExtractor";
 import { roundToTwo } from "../../utils/math";
 
 const AI_MODEL = "claude-sonnet-4-5";
@@ -1474,8 +1480,21 @@ export function parseAIResponse(aiResponse: string): AnalysisResult {
   return fallback;
 }
 
+function summarizeLargeTextForAI(text: string): string {
+  const lines = text.split("\n");
+  const headers = lines.slice(0, 50).join("\n");
+  const transactions = lines.filter(l => /(\d{1,2}\/\d{1,2})|\d+\.\d{2}/.test(l));
+  
+  // Pick a subset of transactions if too many
+  const sampledTxns = transactions.length > 300 
+    ? [...transactions.slice(0, 150), "... (truncated) ...", ...transactions.slice(-150)]
+    : transactions;
+    
+  return `[SUMMARY MODE - ORIGINAL SIZE: ${text.length} chars]\n\nHEADERS:\n${headers}\n\nKEY TRANSACTION LINES:\n${sampledTxns.join("\n")}`;
+}
+
 export async function callAIWithRetry(prompt: string, content: string, meta?: { leadId?: number; callType?: string }): Promise<string> {
-//   scrubLog("SCRUB-AI-CALL", `callType="${meta?.callType || "analysis"}" leadId=${meta?.leadId || "?"} model=${AI_MODEL} contentLen=${content.length} promptLen=${prompt.length}`);
+  const label = `[AI-${meta?.callType || "General"}]`;
   await acquireAiSlot();
   try {
     let lastError: Error | null = null;
@@ -1489,18 +1508,23 @@ export async function callAIWithRetry(prompt: string, content: string, meta?: { 
           system: prompt,
           messages: [{ role: "user", content: content + "\n\nOutput ONLY the JSON object — no explanation, no markdown, no commentary." }],
         });
-        const inputTokens = (completion.usage as any)?.input_tokens || Math.ceil(content.length / CHARS_PER_TOKEN_ESTIMATE);
+        const inputTokens = (completion.usage as any)?.input_tokens || Math.ceil(content.length / 4);
         const outputTokens = (completion.usage as any)?.output_tokens || 0;
         costTracker.record(meta?.leadId ?? null, meta?.callType || "analysis", inputTokens, outputTokens);
-//         scrubLog("SCRUB-AI-CALL", `Success: inputTokens=${inputTokens}, outputTokens=${outputTokens}, stopReason=${completion.stop_reason}`);
+        
         for (const block of completion.content) {
           if (block.type === "text" && block.text.trim().length > 2) return block.text;
         }
         return "{}";
       } catch (e: any) {
         lastError = e;
-        const isRateLimit = e.status === 429 || e.message?.includes("429") || e.message?.includes("RATELIMIT");
-        // console.error(`AI call attempt ${attempt + 1}/${maxAttempts} failed:`, e.message);
+        const status = e.status || e.statusCode;
+        const msg = e.message || String(e);
+        const isRateLimit = status === 429 || msg.includes("429") || msg.includes("RATELIMIT");
+        const isAuthError = status === 401 || msg.includes("401") || msg.includes("invalid x-api-key");
+        
+        scrubLog("AI-ERROR", `Attempt ${attempt + 1}/${maxAttempts} failed (status=${status}): ${msg.slice(0, 100)}...`);
+
         if (attempt < maxAttempts - 1) {
           let delay: number;
           if (isRateLimit) {
@@ -1510,7 +1534,10 @@ export async function callAIWithRetry(prompt: string, content: string, meta?: { 
             } else {
               delay = 5000 * Math.pow(2, attempt) + Math.random() * 2000;
             }
-            // console.log(`[AI] Rate limited — waiting ${Math.round(delay / 1000)}s before retry`);
+          } else if (isAuthError) {
+             // If it's an auth error on a HUGE document, it might be a proxy issue. 
+             // We'll wait a bit and retry, maybe it's transient.
+             delay = 2000 * Math.pow(2, attempt);
           } else {
             delay = RETRY_DELAY_MS * Math.pow(2, attempt);
           }
@@ -1564,7 +1591,7 @@ Return ONLY valid JSON (no markdown, no backticks):
 
 If no loans found, return: {"hasExistingLoans": false, "recurringPulls": [], "riskFactors": [], "nsfCount": 0, "negativeDays": [], "avgDailyBalance": 0, "hasNegativeBalance": false, "lowestBalance": 0}`;
 
-function tryParserFirstExtraction(docs: any[], docTexts: Map<number, string>, traceCollector?: StructuredTraceCollector): {
+function tryParserFirstExtraction(lead: any, docs: any[], docTexts: Map<number, string>, traceCollector?: StructuredTraceCollector): {
   confident: boolean;
   monthlyRevenues: Array<{ month: string; revenue: number; account: string }>;
   reason: string;
@@ -1591,6 +1618,25 @@ function tryParserFirstExtraction(docs: any[], docTexts: Map<number, string>, tr
 //       scrubLog("PARSER-FIRST", `doc.id=${doc.id} "${doc.name}": could NOT extract month — marking not confident`);
       allConfident = false;
       continue;
+    }
+
+    // Detect combined statements (multiple accounts)
+    const summaryCount = (text.match(/Account summary/gi) || []).length;
+    if (summaryCount > 1) {
+//       traceCollector?.addDepositCandidate({ field: "multi_account_check", value: 0, regexRuleName: "summary_count", nearbyText: `found ${summaryCount} summaries`, confidence: "low", selected: false });
+      allConfident = false;
+      continue;
+    }
+
+    // Business Name Matching (Requirement #1)
+    const statementName = extractBusinessNameFromText(text);
+    if (statementName && lead.businessName) {
+      const matchScore = fuzzyBusinessMatch(statementName, lead.businessName);
+      if (matchScore < 70) {
+        // console.log(`[ParserFirst] Business name mismatch: Statement="${statementName}" vs Lead="${lead.businessName}" (score=${matchScore}) — marking not confident`);
+        allConfident = false;
+        continue;
+      }
     }
 //     scrubLog("PARSER-FIRST", `doc.id=${doc.id} "${doc.name}": monthKey="${monthKey}", isOCR=${isOcrText}`);
 
@@ -1685,7 +1731,7 @@ async function analyzeDocumentBatch(
 
   // console.log(`${batchLabel} [SCRUB-ANALYZE] Combined text: ${combinedText.length} chars, rawStatementText: ${rawStatementText.length} chars`);
 
-  const parserResult = tryParserFirstExtraction(docs, docTexts, structuredTrace);
+  const parserResult = tryParserFirstExtraction(lead, docs, docTexts, structuredTrace);
   // console.log(`${batchLabel} [SCRUB-PARSER-FIRST] confident=${parserResult.confident}, reason="${parserResult.reason}", months=${parserResult.monthlyRevenues.length}`);
   if (parserResult.confident) {
     for (const mr of parserResult.monthlyRevenues) {
@@ -1776,7 +1822,19 @@ async function analyzeDocumentBatch(
     let aiResponseStr: string;
     if (engineFoundLoans) {
       // console.log(`${batchLabel} [ParserFirst] Transaction engine found ${engineRecurring.length} recurring payments, ${engineFunding.length} funding deposits — confirming with loan-only AI`);
-      const loanOnlyResponse = await callAIWithRetry(LOAN_ONLY_PROMPT, combinedText, { leadId: lead.id, callType: "loan-only" });
+      let loanOnlyResponse = "";
+      try {
+        loanOnlyResponse = await callAIWithRetry(LOAN_ONLY_PROMPT, combinedText, { leadId: lead.id, callType: "loan-only" });
+      } catch (e: any) {
+        scrubLog("Analysis", `${batchLabel} AI loop failed for large doc (${combinedText.length} chars) — retrying in Small-Footprint mode...`);
+        try {
+          const summarized = summarizeLargeTextForAI(combinedText);
+          loanOnlyResponse = await callAIWithRetry(LOAN_ONLY_PROMPT, summarized, { leadId: lead.id, callType: "loan-only-summarized" });
+        } catch (e2: any) {
+          scrubLog("Analysis", `${batchLabel} AI Small-Footprint fallback failed: ${e2.message} — using parser results only`);
+          loanOnlyResponse = JSON.stringify({ hasExistingLoans: true, recurringPulls: [] });
+        }
+      }
       aiResponseStr = `[ParserFirst:deposits+engineLoans] ${loanOnlyResponse}`;
       try {
         loanData = parseAIResponse(loanOnlyResponse);
@@ -1896,8 +1954,20 @@ async function analyzeDocumentBatch(
       const allDocsText = docs.map(d => docTexts.get(d.id) || "").join("\n");
       const rawScanMatch = allDocsText.match(rawTextLenderScan);
       if (rawScanMatch) {
-        // console.log(`${batchLabel} [ParserFirst] Transaction engine missed lenders but raw text scan found "${rawScanMatch[0]}" — calling loan-only AI`);
-        const loanOnlyResponse = await callAIWithRetry(LOAN_ONLY_PROMPT, combinedText, { leadId: lead.id, callType: "loan-only-rawscan" });
+//         scrubLog("Analysis", `${label} Transaction engine missed lenders but raw text scan found "${rawScanMatch[0]}" — calling loan-only AI`);
+        let loanOnlyResponse = "";
+        try {
+          loanOnlyResponse = await callAIWithRetry(LOAN_ONLY_PROMPT, combinedText, { leadId: lead.id, callType: "loan-only-rawscan" });
+        } catch (e: any) {
+          console.error(`${batchLabel} AI rawscan loop failed — retrying in Small-Footprint mode...`);
+          try {
+             const summarized = summarizeLargeTextForAI(combinedText);
+             loanOnlyResponse = await callAIWithRetry(LOAN_ONLY_PROMPT, summarized, { leadId: lead.id, callType: "loan-only-rawscan-summarized" });
+          } catch (e2: any) {
+             console.error(`${batchLabel} AI rawscan Small-Footprint failed: ${e2.message} — using default fallback`);
+             loanOnlyResponse = JSON.stringify({ hasExistingLoans: true, recurringPulls: [] });
+          }
+        }
         aiResponseStr = `[ParserFirst:deposits+rawScanLoans] ${loanOnlyResponse}`;
         try {
           loanData = parseAIResponse(loanOnlyResponse);
@@ -2009,6 +2079,7 @@ async function analyzeDocumentBatch(
 
   let parserLoanRecurring: ReturnType<typeof extractAllTransactions>["recurringPayments"] = [];
   let parserLoanFunding: ReturnType<typeof extractAllTransactions>["fundingDeposits"] = [];
+  const aggregatedParserRevenues: Array<{ month: string; revenue: number; account: string; bank: string }> = [];
   for (const doc of docs) {
     const text = docTexts.get(doc.id);
     if (!text) continue;
@@ -2025,7 +2096,18 @@ async function analyzeDocumentBatch(
     }
     parserLoanRecurring = [...parserLoanRecurring, ...txnResult.recurringPayments];
     parserLoanFunding = [...parserLoanFunding, ...txnResult.fundingDeposits];
+
+    const monthStr = parsed.statementPeriod?.end ? new Date(parsed.statementPeriod.end).toISOString().slice(0, 7) : "";
+    if (monthStr && (parsed.totalDeposits || 0) > 0) {
+      aggregatedParserRevenues.push({
+        month: monthStr,
+        revenue: parsed.totalDeposits || 0,
+        account: parsed.accountNumber || "unknown",
+        bank: parsed.bankName || "unknown"
+      });
+    }
   }
+
 
   const preDedup2Count = parserLoanRecurring.length;
   const { recurring: dedupedParserRecurring, funding: dedupedParserFunding } = deduplicateLoansAcrossAccounts(parserLoanRecurring, parserLoanFunding);
@@ -2040,15 +2122,53 @@ async function analyzeDocumentBatch(
   }
 
   console.log(`${batchLabel} [SCRUB-AI] Parser NOT confident — calling full AI (parser found ${parserLoanRecurring.length} recurring, ${parserLoanFunding.length} funding from parsed txns)`);
-  const aiResponse = await callAIWithRetry(fullPrompt, combinedText, { leadId: lead.id, callType: "full-analysis" });
-  const analysis = parseAIResponse(aiResponse);
+  let aiResponse = "";
+  try {
+    aiResponse = await callAIWithRetry(fullPrompt, combinedText, { leadId: lead.id, callType: "full-analysis" });
+  } catch (e: any) {
+    console.error(`${batchLabel} Full AI analysis failed: ${e.message} — falling back to parser revenue`);
+    const fallbackRevs = aggregatedParserRevenues.map(r => ({
+      month: r.month,
+      revenue: r.revenue,
+      confidence: "medium",
+      account: r.account,
+      bank: r.bank
+    }));
+    aiResponse = JSON.stringify({ 
+      monthlyRevenues: fallbackRevs, 
+      loanDetails: [], 
+      hasExistingLoans: parserLoanRecurring.length > 0 
+    });
+  }
+  let analysis: AnalysisResult;
+  try {
+    analysis = parseAIResponse(aiResponse);
+  } catch {
+    analysis = {
+      monthlyRevenues: [],
+      loanDetails: [],
+      hasExistingLoans: false,
+      riskFactors: [],
+      nsfCount: 0,
+      negativeDays: [],
+      avgDailyBalance: 0,
+      hasLoans: false,
+      hasOnDeck: false,
+      revenueTrend: "stable",
+      riskScore: "B1",
+      grossRevenue: 0,
+      bankName: null
+    };
+  }
 
   if (parserLoanRecurring.length > 0 || parserLoanFunding.length > 0) {
     const aiLenderEntries = (analysis.loanDetails || []) as any[];
     for (const r of parserLoanRecurring) {
+      const rLender = (r as any).lender || (r as any).description || "Unknown";
+      const rShortName = (r as any).shortName || (rLender.split(" ")[0]);
       let matchedAIEntry: any = null;
       const alreadyInAI = aiLenderEntries.some(aiEntry => {
-        if (!areSameLender(aiEntry.lender || "", r.lender) && !areSameLender(aiEntry.lender || "", r.shortName)) return false;
+        if (!areSameLender(aiEntry.lender || "", rLender) && !areSameLender(aiEntry.lender || "", rShortName)) return false;
         const ratio = Math.max(aiEntry.amount || 0, r.amount) / Math.min(aiEntry.amount || 1, r.amount || 1);
         if (ratio <= 1.20) {
           matchedAIEntry = aiEntry;
@@ -2057,10 +2177,10 @@ async function analyzeDocumentBatch(
         return false;
       });
       if (alreadyInAI && matchedAIEntry && matchedAIEntry.amount !== r.amount) {
-        console.log(`${batchLabel} [Parser→AI-Merge] Correcting AI amount for "${r.lender}": AI $${matchedAIEntry.amount} → parser $${r.amount} (parser is ground truth, AI override blocked)`);
+        console.log(`${batchLabel} [Parser→AI-Merge] Correcting AI amount for "${rLender}": AI $${matchedAIEntry.amount} → parser $${r.amount} (parser is ground truth, AI override blocked)`);
         if (structuredTrace) {
           structuredTrace.addAIChange({
-            field: `loan_amount:${r.lender}`,
+            field: `loan_amount:${rLender}`,
             originalValue: r.amount,
             aiOutput: matchedAIEntry.amount,
             finalValue: r.amount,
@@ -2074,20 +2194,20 @@ async function analyzeDocumentBatch(
         if (r.frequency) matchedAIEntry.frequency = r.frequency;
       }
       if (!alreadyInAI) {
-        const verifiedAmount = crossCheckLenderAmountInText(r.lender, r.shortName, r.amount, rawStatementText);
+        const verifiedAmount = crossCheckLenderAmountInText(rLender, rShortName, r.amount, rawStatementText);
         if (verifiedAmount !== null) {
           const useAmount = verifiedAmount || r.amount;
           if (verifiedAmount && verifiedAmount !== r.amount) {
-            console.log(`${batchLabel} [Parser→AI-Merge] Cross-check corrected "${r.lender}": parser $${r.amount} → text $${useAmount}`);
+            console.log(`${batchLabel} [Parser→AI-Merge] Cross-check corrected "${rLender}": parser $${r.amount} → text $${useAmount}`);
           }
-          console.log(`${batchLabel} [Parser→AI-Merge] Adding parser-detected lender "${r.lender}" ($${useAmount} x${r.occurrences}) not found in AI`);
+          console.log(`${batchLabel} [Parser→AI-Merge] Adding parser-detected lender "${rLender}" ($${useAmount} x${r.occurrences}) not found in AI`);
           if (!analysis.loanDetails) analysis.loanDetails = [];
           analysis.loanDetails.push({
-            lender: r.lender, amount: useAmount, frequency: r.frequency, occurrences: r.occurrences,
+            lender: rLender, amount: useAmount, frequency: r.frequency, occurrences: r.occurrences,
           });
           analysis.hasLoans = true;
         } else {
-          console.log(`${batchLabel} [Parser→AI-Merge] SKIPPING "${r.lender}" ($${r.amount}) — cross-check found no matching amount near lender name in text`);
+          console.log(`${batchLabel} [Parser→AI-Merge] SKIPPING "${rLender}" ($${r.amount}) — cross-check found no matching amount near lender name in text`);
         }
       }
     }
@@ -2243,7 +2363,7 @@ const MONTH_ABBRS_MAP: Record<string, number> = {
 export function extractMonthFromSection(text: string): string {
   const header = text.slice(0, 3000);
 
-  const stmtPeriodMatch = header.match(/Statement\s+Period:\s*(.+?)\s+to\s+(.+?)(?:\n|$)/i);
+  const stmtPeriodMatch = header.match(/Statement\s+(?:Period|Dates)[:\s]*(.+?)\s+(?:to|thru)\s+(.+?)(?:\n|$)/i);
   if (stmtPeriodMatch) {
     const startDate = stmtPeriodMatch[1].trim();
     const endDate = stmtPeriodMatch[2].trim();
@@ -2318,6 +2438,7 @@ export function extractMonthFromSection(text: string): string {
   const endingPats = [
     /(?:statement\s+ending|period\s*ending|closing\s*date|ending\s+balance\s+on|statement\s*date)[:\s]*(\d{1,2})\/(\d{1,2})\/(\d{2,4})/i,
     /(?:statement\s+ending|period\s*ending|closing\s*date|ending\s+balance\s+on|statement\s*date)[:\s]*(\w{3,9})\s+\d{1,2}\s*,?\s*(\d{4})/i,
+    /(?:^|\n)\s*Date[:\s]*(\d{1,2})\/(\d{1,2})\/(\d{2,4})/i,
   ];
   for (const pat of endingPats) {
     const m = header.match(pat);
@@ -2382,6 +2503,7 @@ function extractDebitTotalFromSection(sectionText: string): number {
     /(?:withdrawals?|debits?)\s+(?:and\s+other\s+)?(?:subtractions?|charges?)?\s+\$?([\d,]+\.?\d*)/gi,
     /(?:checks?\s+paid\s+and\s+other\s+)?(?:withdrawals?\s+and\s+(?:other\s+)?(?:debits?|subtractions?))\s+\$?([\d,]+\.?\d*)/gi,
     /withdrawals?\s*\/\s*debits?\s+\$?([\d,]+\.\d{2})/gi,
+    /(\d+)\s+checks?\s*\/\s*debits?\s+\$?([\d,]+\.\d{2})/gi,
     /(?:^|\n)\s*(?:total\s+)?(?:withdrawals?|debits?)\s+\$?([\d,]+\.\d{2})/gim,
     /(?:checks?\s+and\s+other\s+)?debits?\s*\(-\)\s*\$?\s*([\d,]+\.\d{2})/gi,
   ];
@@ -2906,7 +3028,7 @@ function parseMoneyFromLine(line: string): number | null {
 }
 
 function extractChaseAccountSummaryFromSection(sectionText: string): number {
-  const labelMatch = sectionText.match(/deposits?\s+and\s+other\s+credits?[\s:]*(?:\n|(?=\$))/i);
+  const labelMatch = sectionText.match(/(?:deposits?\s+and\s+other\s+credits?|deposits?\s*\/\s*credits?)[\s:]*(?:\n|(?=\$))/i);
   if (!labelMatch) return 0;
 
   const inlineAmt = labelMatch[0].match(/\$?([\d,]+\.\d{2})/);
@@ -2935,7 +3057,7 @@ function extractChaseAccountSummaryFromSection(sectionText: string): number {
     }
   }
 
-  const depositIdx = descLabels.findIndex(l => /deposits?\s+and\s+other\s+credits?/i.test(l));
+  const depositIdx = descLabels.findIndex(l => /(?:deposits?\s+and\s+other\s+credits?|deposits?\s*\/\s*credits?)/i.test(l));
   if (depositIdx >= 0 && depositIdx < amountValues.length) {
     const amt = amountValues[depositIdx];
     if (amt > 100 && amt < 100_000_000) {
@@ -2965,19 +3087,20 @@ function extractChaseAccountSummaryFromSection(sectionText: string): number {
 function extractMultiCategoryDeposits(sectionText: string): number {
   const cleanText = sectionText.replace(/\|/g, ' ').replace(/[-]{3,}/g, ' ');
   const DEPOSIT_CATEGORIES = [
-    { label: "deposits", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?(?:Total\s+)?Deposits?\s+(?:(\d{1,3})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im, exclusive: true },
-    { label: "automatic", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Automatic\s+(?:Deposits?|Additions?)\s+(?:(\d{1,3})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
-    { label: "electronic", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Electronic\s+(?:Deposits?|Additions?)\s+(?:(\d{1,3})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
-    { label: "direct", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Direct\s+(?:Deposits?|Additions?)\s+(?:(\d{1,3})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
-    { label: "mobile", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Mobile\s+(?:Deposits?|Additions?)\s+(?:(\d{1,3})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
-    { label: "wire", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?(?:Wire|Incoming)\s+(?:Deposits?|Additions?)\s+(?:(\d{1,3})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
-    { label: "misc", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?(?:Misc(?:ellaneous)?|Other)\s+(?:Deposits?|Additions?)\s+(?:(\d{1,3})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
-    { label: "otherCredits", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Other\s+Credits?\s+(?:(\d{1,3})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
-    { label: "customer", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Customer\s+(?:Deposits?|Additions?)\s+(?:(\d{1,3})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
-    { label: "ach", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?ACH\s+(?:Deposits?|Credits?|Additions?)\s+(?:(\d{1,3})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
-    { label: "teller", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Teller\s+(?:Deposits?|Additions?)\s+(?:(\d{1,3})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
-    { label: "atmDeposits", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?ATM\s+(?:Deposits?(?:\s+and\s+Additions?)?|Additions?)\s+(?:(\d{1,3})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
+    { label: "deposits", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?(?:Total\s+)?Deposits?\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im, exclusive: true },
+    { label: "automatic", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Automatic\s+(?:Deposits?|Additions?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
+    { label: "electronic", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Electronic\s+(?:Deposits?|Additions?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
+    { label: "direct", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Direct\s+(?:Deposits?|Additions?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
+    { label: "mobile", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Mobile\s+(?:Deposits?|Additions?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
+    { label: "wire", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?(?:Wire|Incoming)\s+(?:Deposits?|Additions?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
+    { label: "misc", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?(?:Misc(?:ellaneous)?|Other)\s+(?:Deposits?|Additions?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
+    { label: "otherCredits", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Other\s+Credits?\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
+    { label: "customer", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Customer\s+(?:Deposits?|Additions?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
+    { label: "ach", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?ACH\s+(?:Deposits?|Credits?|Additions?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
+    { label: "teller", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?Teller\s+(?:Deposits?|Additions?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
+    { label: "atmDeposits", pattern: /(?:^|\n)\s*(?:\+\s*)?(?:\d{1,3}\s+)?ATM\s+(?:Deposits?(?:\s+and\s+Additions?)?|Additions?)\s+(?:(\d{1,4})\s+)?\$?\s*([\d,]+\.\d{2})\s*\+?/im },
   ];
+
 
   const hasAutoDeposit = /automatic\s+deposit/i.test(cleanText);
   const hasAuto = /automatic/i.test(sectionText);
@@ -3004,6 +3127,7 @@ function extractMultiCategoryDeposits(sectionText: string): number {
     const m = cleanText.match(cat.pattern);
     if (m) {
       const amt = parseFloat((m[2] || m[1]).replace(/,/g, ""));
+
       if (amt > 0 && amt < 100_000_000) {
         if ((cat as any).exclusive) {
           const matchedLine = m[0].trim();
@@ -3288,7 +3412,7 @@ export function extractAccountNumberFromText(text: string): string | null {
   return extractAccountLast4(text);
 }
 
-const NON_REVENUE_CREDIT_FILTER = /\b(transfer\s+from|xfer\s+from|online\s+transfer|internal\s+transfer|transfer\s+between|tfr\s+from|loan\s+proceed|loan\s+disburse|reversal|refund|chargeback|credit\s+adjustment|returned\s+item|nsf\s+reversal|overdraft\s+protection|od\s+protection|courtesy\s+credit|fee\s+reversal|interest\s+paid|interest\s+credit|ondeck|fundbox|bluevine|kabbage|kapitus|can\s*capital|credibly|rapid\s*finance|forward\s*fin|clear\s*balance|libertas|yellowstone|everest\s*bus|mantis\s*fund|cloudfund)\b/i;
+const NON_REVENUE_CREDIT_FILTER = /\b(transfer\s+from|xfer\s+from|online\s+transfer|internal\s+transfer|transfer\s+between|tfr\s+from|loan\s+proceed|loan\s+disburse|reversal|refund|chargeback|credit\s+adjustment|returned\s+item|nsf\s+reversal|overdraft\s+protection|od\s+protection|courtesy\s+credit|fee\s+reversal|interest\s+paid|interest\s+credit|funding|advance|mca|ondeck|forward\s*fin|fundbox|bluevine|kabbage|kapitus|can\s*capital|credibly|rapid\s*finance|clear\s*balance|libertas|yellowstone|everest\s*bus|mantis\s*fund|cloudfund|sba\s*eitl|sba\s*loan|ppp\s*loan)\b/i;
 
 export function sumCreditTransactionsFromSection(sectionText: string): number {
   const creditBlock = sectionText.match(/All Credit Transactions:\n([\s\S]*?)(?=\n(?:All Debit|Total Deposits|---\s+END|={5,})|$)/i);
@@ -7011,35 +7135,9 @@ export async function analyzeSingleLead(leadId: number, options?: { onlyNew?: bo
     acctGroups.get(acct)!.push(doc);
   }
 
-  if (acctGroups.size > 1) {
-//     scrubLog("Analysis", `Lead ${leadId}: Found ${acctGroups.size} accounts: ${Array.from(acctGroups.entries()).map(([k, v]) => `**${k} (${v.length} docs)`).join(", ")}`);
-    for (const [acct, docs] of acctGroups) {
-      let groupBatch: typeof readableDocs = [];
-      let groupBatchSize = 0;
-      for (const doc of docs) {
-        const textLen = docTexts.get(doc.id)!.length + PER_DOC_WRAPPER_OVERHEAD;
-        if (groupBatchSize + textLen > MAX_CHARS_PER_BATCH && groupBatch.length > 0) {
-          batches.push(groupBatch);
-          groupBatch = [];
-          groupBatchSize = 0;
-        }
-        groupBatch.push(doc);
-        groupBatchSize += textLen;
-      }
-      if (groupBatch.length > 0) batches.push(groupBatch);
-    }
-  } else {
-    for (const doc of readableDocs) {
-      const textLen = docTexts.get(doc.id)!.length + PER_DOC_WRAPPER_OVERHEAD;
-      if (currentBatchSize + textLen > MAX_CHARS_PER_BATCH && currentBatch.length > 0) {
-        batches.push(currentBatch);
-        currentBatch = [];
-        currentBatchSize = 0;
-      }
-      currentBatch.push(doc);
-      currentBatchSize += textLen;
-    }
-    if (currentBatch.length > 0) batches.push(currentBatch);
+  // Bypass all grouping logic so each statement forms its own batch and gets its own accurate revenue row
+  for (const doc of readableDocs) {
+    batches.push([doc]);
   }
 
   scrubLog("Re-Scrub", `▶ STEP 4/7 DONE: ${readableDocs.length} docs → ${acctGroups.size} account group(s) → ${batches.length} AI batch(es)`);
@@ -7048,7 +7146,7 @@ export async function analyzeSingleLead(leadId: number, options?: { onlyNew?: bo
 //     scrubLog("SCRUB-BATCH", `  Batch ${bi + 1}: ${batches[bi].map(d => `"${d.name}" (id=${d.id})`).join(", ")}`);
   }
 
-  const DOC_CONCURRENCY = 3;
+  const DOC_CONCURRENCY = 1;
   const batchResults: { idx: number; analysis: AnalysisResult; savedAnalysis: any; confirmations: any[] }[] = [];
   let failedBatchCount = 0;
 
@@ -7312,9 +7410,9 @@ export async function analyzeSingleLead(leadId: number, options?: { onlyNew?: bo
   }
   const sortedMonths = [...monthlyTotals.entries()]
     .sort((a, b) => b[0].localeCompare(a[0]));
-  const recent3 = sortedMonths.slice(0, 3);
-  const computedGross = recent3.length > 0
-    ? Math.round(recent3.reduce((s, [, v]) => s + v, 0) / recent3.length)
+  const historicalMonths = sortedMonths.slice(0, 12);
+  const computedGross = historicalMonths.length > 0
+    ? Math.round(historicalMonths.slice(0, 3).reduce((s, [, v]) => s + v, 0) / Math.min(historicalMonths.length, 3))
     : mergedGross;
 
   const NOT_LOAN_NAMES = /\b(online\s*(?:banking|transfer)|payment\s+to\b|transfer\s+to\s+(?:sav|chk|checking|savings)|apple\s+cash|self\s+financial|intuit\s+financ|isuzu\s+financ|styku|next\s+insur|pmnt\s+sent|bkofamerica|ascentium|leasechg|lease\s+pymt|loan\s+pymt|td\s+auto|orig\s+co\s+name.*(?:visa|bk\s+of\s+amer|ins\b)|online\s*(?:pay|banking|bill)|autopay\s+to|credit\s*card|card\s+ending|insurance|payroll|adp\b|gusto\b|paychex|irs\b|rent\b|lease\b|utility|electric|ally\s+id:|withdrwl\b|orig\s+co\s+finance|figure\s+lending)\b/i;
@@ -7357,8 +7455,9 @@ export async function analyzeSingleLead(leadId: number, options?: { onlyNew?: bo
   }, 0);
 
   let estimatedApproval = 0;
-  if (recent3.length > 0) {
-    const avgRevenueForApproval = recent3.reduce((s, [, v]) => s + v, 0) / recent3.length;
+  if (historicalMonths.length > 0) {
+    const rec3 = historicalMonths.slice(0, 3);
+    const avgRevenueForApproval = rec3.reduce((s, [, v]) => s + v, 0) / rec3.length;
     estimatedApproval = Math.round(avgRevenueForApproval * 0.25);
   }
 

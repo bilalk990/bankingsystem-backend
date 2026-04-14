@@ -6,7 +6,7 @@ import { usersTable } from "./users";
 
 export const leadMessagesTable = pgTable("lead_messages", {
   id: serial("id").primaryKey(),
-  leadId: integer("lead_id").notNull().references(() => leadsTable.id),
+  leadId: integer("lead_id").notNull().references(() => leadsTable.id, { onDelete: "cascade" }),
   source: text("source").notNull(),
   direction: text("direction").notNull().default("inbound"),
   content: text("content"),
